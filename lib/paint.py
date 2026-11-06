@@ -7,6 +7,8 @@ import argparse
 import json
 import re
 import sys
+import os
+import subprocess
 import time
 from pathlib import Path
 
@@ -20,7 +22,7 @@ VENDOR = HERE.parent / "vendor"
 def build_parser():
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", required=True, help="输入图片")
-    ap.add_argument("--out", required=True, help="输出 PNG")
+    ap.add_argument("--out", default="", help="输出 PNG")
     ap.add_argument("--svg", required=True, help="输出 SVG")
     ap.add_argument("--size", type=int, default=2048, help="输出长边像素")
     ap.add_argument("--trace", type=int, default=0, help="描摹分辨率，0=与 size 相同")
@@ -33,11 +35,27 @@ def build_parser():
     ap.add_argument("--label", default="矢量化")
     ap.add_argument("--prog", default="", help="进度文件（JSON，dsh-lamp 兼容）")
     ap.add_argument("--ctl", default="", help="控制文件（pause / resume / stop）")
+    ap.add_argument("--trace-only", action="store_true", help="内部参数：只做矢量化（供父进程调用）")
     return ap
 
 
 def main():
     args = build_parser().parse_args()
+
+    # 子进程模式：只负责 vtracer 那一下，父进程负责心跳
+    if args.trace_only:
+        if VENDOR.exists():
+            sys.path.insert(0, str(VENDOR))
+        import vtracer
+        vtracer.convert_image_to_svg_py(
+            args.src, args.svg,
+            colormode="color", hierarchical="stacked", mode="spline",
+            filter_speckle=args.speckle, color_precision=args.precision,
+            layer_difference=args.layer_diff, corner_threshold=args.corner,
+            length_threshold=4.0, max_iterations=10, splice_threshold=45,
+            path_precision=3,
+        )
+        return 0
 
     # 优先用插件自带的 vtracer；没有就退回环境里的
     if VENDOR.exists():
@@ -50,6 +68,9 @@ def main():
         print(f"缺少 vtracer：{exc}", file=sys.stderr)
         return 2
 
+    if not args.out or not args.svg:
+        print("缺少 --out / --svg", file=sys.stderr)
+        return 2
     prog = Path(args.prog) if args.prog else None
     ctl = Path(args.ctl) if args.ctl else None
     start_ms = int(time.time() * 1000)
@@ -81,9 +102,9 @@ def main():
         side = min(w, h)
         src = src.crop(((w - side) // 2, (h - side) // 2, (w + side) // 2, (h + side) // 2))
         w, h = src.size
-    # 中间文件放进度文件旁边，不污染画库
-    tmp_base = Path(args.prog).parent if args.prog else Path(args.svg).parent
-    tmp = tmp_base / "_tmp"
+    # 中间文件放系统临时目录，不污染画库、也不受画库路径权限影响
+    import tempfile
+    tmp = Path(tempfile.gettempdir()) / "dsh-paint-tmp"
     tmp.mkdir(parents=True, exist_ok=True)
     src_png = tmp / "input.png"
     src.save(src_png)
@@ -98,18 +119,49 @@ def main():
     big.save(big_png)
     tick(20, "上采样")
 
-    # ── 3. 矢量化 ──
+    # ── 3. 矢量化（这一步不可中断，用心跳线程告诉外界“我在算”）──
     svg_path = Path(args.svg)
     svg_path.parent.mkdir(parents=True, exist_ok=True)
-    vtracer.convert_image_to_svg_py(
-        str(big_png), str(svg_path),
-        colormode="color", hierarchical="stacked", mode="spline",
-        filter_speckle=args.speckle, color_precision=args.precision,
-        layer_difference=args.layer_diff, corner_threshold=args.corner,
-        length_threshold=4.0, max_iterations=10, splice_threshold=45,
-        path_precision=3,
-    )
-    tick(45, "矢量化完成")
+
+    # vtracer 调用期间会占住 GIL，Python 线程跑不起来 —— 所以丢给子进程，
+    # 父进程在旁边一边等一边写心跳（这样灯才有反馈）。
+    trace_started = time.time()
+    child_args = [
+        sys.executable, str(Path(__file__).resolve()),
+        "--trace-only",
+        "--src", str(big_png),
+        "--svg", str(svg_path),
+        "--speckle", str(args.speckle),
+        "--precision", str(args.precision),
+        "--layer-diff", str(args.layer_diff),
+        "--corner", str(args.corner),
+    ]
+    child_env = dict(os.environ)
+    if VENDOR.exists():
+        child_env["PYTHONPATH"] = str(VENDOR) + os.pathsep + child_env.get("PYTHONPATH", "")
+
+    child = subprocess.Popen(child_args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=child_env)
+    last_beat = 0.0
+    while child.poll() is None:
+        time.sleep(0.4)
+        used = time.time() - trace_started
+        if used - last_beat >= 2.0:
+            last_beat = used
+            pct = min(44, 20 + int(used * 0.4))
+            _write(prog, running=True, paused=False, label=args.label, done=pct, total=100,
+                   elapsed=round(time.time() - t0, 1), eta=0,
+                   note=f"算法运行中（描摹）· 已用 {int(used)} 秒",
+                   updated=time.strftime("%H:%M:%S"))
+    err = child.stderr.read().decode("utf-8", "ignore") if child.stderr else ""
+    child.stderr.close() if child.stderr else None
+    if child.returncode != 0:
+        raise RuntimeError("矢量化失败：" + (err.strip().splitlines()[-1] if err.strip() else f"exit {child.returncode}"))
+
+    trace_seconds = int(time.time() - trace_started)
+    _write(prog, running=True, paused=False, label=args.label, done=45, total=100,
+           elapsed=round(time.time() - t0, 1), eta=0,
+           note=f"描摹完成 · 用时 {trace_seconds} 秒",
+           updated=time.strftime("%H:%M:%S"))
 
     # ── 4. 解析 ──
     text = svg_path.read_text(encoding="utf-8")
