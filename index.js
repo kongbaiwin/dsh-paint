@@ -6,7 +6,7 @@
 //   模块通过同一份接口接入：{ id, label, desc, tools, progressFile, controlFile, routes }
 //   拔掉 paint 模块，灯照样能看别的任务。
 import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, statSync, unlinkSync } from 'node:fs'
-import { execFile } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { homedir } from 'node:os'
 import { join, dirname, resolve, extname, basename, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -14,6 +14,9 @@ import { fileURLToPath } from 'node:url'
 const HERE = dirname(fileURLToPath(import.meta.url))
 const PAINT_SCRIPT = join(HERE, 'lib', 'paint.py')
 const text = (v) => [{ type: 'text', text: String(v) }]
+
+// 正在运行的算法进程：模块 id → { pid, startedAt }
+const LIVE = new Map()
 
 const DSH_HOME = process.env.DSH_HOME || join(homedir(), '.dsh')
 const DATA_DIR = join(DSH_HOME, 'dsh-paint')
@@ -217,13 +220,23 @@ function runPaint (opts) {
   if (opts.crop) args.push('--crop')
 
   return new Promise((done) => {
-    execFile(py, args, { timeout: 30 * 60 * 1000, windowsHide: true, maxBuffer: 8 * 1024 * 1024 },
-      (err, stdout, stderr) => {
-        let parsed = null
-        const line = String(stdout || '').trim().split('\n').filter(Boolean).pop() || ''
-        try { parsed = JSON.parse(line) } catch { /* 不是 JSON */ }
-        done({ ok: !err && !!parsed, err, stderr: String(stderr || ''), result: parsed, png, svg, size })
-      })
+    // 用 spawn 而不是 execFile：拿到 pid，才能做「进程还活着吗」的判定
+    const child = spawn(py, args, { windowsHide: true })
+    LIVE.set('paint', { pid: child.pid, startedAt: Date.now() })
+    let out = ''
+    let err = ''
+    child.stdout.on('data', (d) => { out += d.toString() })
+    child.stderr.on('data', (d) => { err += d.toString() })
+    const finish = (code) => {
+      LIVE.delete('paint')
+      let parsed = null
+      const line = out.trim().split('\n').filter(Boolean).pop() || ''
+      try { parsed = JSON.parse(line) } catch { /* 不是 JSON */ }
+      done({ ok: code === 0 && !!parsed, stderr: err, result: parsed, png, svg, size })
+    }
+    child.on('close', (code) => finish(code))
+    child.on('error', (e) => { err += String(e && e.message || e); finish(-1) })
+    setTimeout(() => { try { child.kill() } catch { /* 忽略 */ } }, 30 * 60 * 1000)
   })
 }
 
@@ -274,7 +287,18 @@ export function apply (ctx) {
         updated: p.updated,
         error: p.error ? String(p.error) : null,
         ageMs,
-        stale: !!p.running && ageMs > (cfg.staleMs || 45000),
+        // paint 模块用进程存活判定；其余（灯盯的任意文件）仍按 mtime 推测
+        alive: t.module === 'paint' ? LIVE.has('paint') : undefined,
+        stale: (() => {
+          if (!p.running) return false
+          if (t.module === 'paint') {
+            // 进程还在 → 永远不是无响应（哪怕很久没写进度）
+            if (LIVE.has('paint')) return false
+            // 进程没了却还标 running → 确实已经死了
+            return true
+          }
+          return ageMs > (cfg.staleMs || 45000)
+        })(),
       })
     }
     if (!tasks.length) return sendJson(res, { ok: true, present: false, label: cfg.label, doneHoldMs: cfg.doneHoldMs })

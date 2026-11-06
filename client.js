@@ -302,6 +302,8 @@ window.__ModuleLoader__.load({
       const rows = tasks.map((t) => {
         const errored = !!t.error
         const stale = !!t.stale && !errored
+        // 进程还活着但很久没写进度 → 只是长步骤，不是无响应
+        const longStep = stale && t.module !== 'paint' && (t.ageMs || 0) < 180000
         const live = !!t.running && !stale
         const stopped = !!t.stopped
         const paused = !!t.paused
@@ -319,7 +321,7 @@ window.__ModuleLoader__.load({
                   : stale ? 'var(--dsw-alias-state-warn-primary)' : 'inherit',
               },
             },
-              (t.label || '任务') + (errored ? ' 出错' : stale ? ' 无响应' : paused ? ' 已暂停' : stopped ? ' 已停止' : full ? ' 完成' : '')),
+              (t.label || '任务') + (errored ? ' 出错' : stale ? (longStep ? ' 仍在计算' : ' 无响应') : paused ? ' 已暂停' : stopped ? ' 已停止' : full ? ' 完成' : '')),
             h('span', { style: { marginLeft: 'auto', fontSize: 11, color: full ? 'var(--dsw-alias-state-success-primary)' : 'inherit', opacity: .8 } },
               full ? '100%' : (t.pct || 0) + '%'),
             live ? btn(paused ? '继续' : '暂停', paused ? 'resume' : 'pause', t.index === undefined ? 0 : t.index) : null,
@@ -341,7 +343,9 @@ window.__ModuleLoader__.load({
           ),
           h('div', { style: { marginTop: 3, fontSize: 10, opacity: .6 } },
             errored ? ('出错：' + String(t.error).slice(0, 50))
-              : stale ? ('超过 30 秒没更新，进程可能已经没了（' + (t.done || 0) + ' / ' + (t.total || '?') + '）')
+              : stale ? (longStep
+                ? ('这一步比较久（' + Math.round((t.ageMs || 0) / 1000) + ' 秒没写进度），进程还在跑')
+                : (t.module === 'paint' ? '算法进程已退出，任务没写完（' + (t.done || 0) + '%）' : '超过 3 分钟没更新，进程可能已经没了'))
                 : [
                 // total=100 表示“按百分比报进度”，不必再显示成 62/100
                 (t.total && t.total !== 100) ? t.done + ' / ' + t.total : '',
