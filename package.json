@@ -1,0 +1,36 @@
+{
+  "name": "dsh-paint",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "让 AI 把图片重画成矢量画：本地色块描摹 + 自写渲染器，纯 CPU、不联网、不训练，输出可无限放大的 SVG 与 PNG",
+  "license": "MIT",
+  "author": "kongbaiwin",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "vectorize",
+    "svg",
+    "vtracer",
+    "image",
+    "paint"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "lib/paint.py",
+    "vendor/",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": { "platform": "web", "immediately": true }
+  }
+}

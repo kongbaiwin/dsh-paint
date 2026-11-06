@@ -1,0 +1,8 @@
+﻿_vendor_tmp/
+_test.*
+_prog.json
+_paint_tmp/
+__pycache__/
+*.pyc
+node_modules/
+画/
